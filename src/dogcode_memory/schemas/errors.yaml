@@ -1,0 +1,28 @@
+name: errors
+space: agent
+file_pattern: "{error_hash}.md"
+operation_mode: upsert
+description: "错误知识 - 常见报错及解决方案"
+fields:
+  - name: error_hash
+    type: string
+    merge_op: immutable
+    description: "错误摘要哈希"
+  - name: error_message
+    type: string
+    merge_op: immutable
+    description: "错误信息"
+  - name: cause
+    type: string
+    merge_op: patch
+    description: "根本原因"
+  - name: solution
+    type: string
+    merge_op: patch
+    description: "解决方案"
+  - name: occurrence_count
+    type: int
+    merge_op: sum
+    init_value: 1
+    description: "出现次数"
+enabled: true

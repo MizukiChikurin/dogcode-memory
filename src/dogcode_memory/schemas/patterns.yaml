@@ -1,0 +1,23 @@
+name: patterns
+space: agent
+file_pattern: "{pattern_name}.md"
+operation_mode: upsert
+description: "编码模式 - 常用设计模式、重构策略"
+fields:
+  - name: pattern_name
+    type: string
+    merge_op: immutable
+    description: "模式名称"
+  - name: description
+    type: string
+    merge_op: patch
+    description: "模式描述"
+  - name: usage_context
+    type: string
+    merge_op: patch
+    description: "适用场景"
+  - name: examples
+    type: string
+    merge_op: append
+    description: "示例代码"
+enabled: true

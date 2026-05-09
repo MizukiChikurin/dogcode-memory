@@ -1,0 +1,27 @@
+name: preferences
+space: user
+file_pattern: "{topic}.md"
+operation_mode: upsert
+description: "编码偏好 - 命名风格、测试策略、注释风格"
+fields:
+  - name: topic
+    type: string
+    merge_op: immutable
+    description: "偏好主题"
+  - name: naming_style
+    type: string
+    merge_op: patch
+    description: "命名风格"
+  - name: test_strategy
+    type: string
+    merge_op: patch
+    description: "测试策略"
+  - name: comment_style
+    type: string
+    merge_op: patch
+    description: "注释风格"
+  - name: code_formatting
+    type: string
+    merge_op: patch
+    description: "代码格式化偏好"
+enabled: true

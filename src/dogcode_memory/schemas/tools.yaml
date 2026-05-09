@@ -1,0 +1,33 @@
+name: tools
+space: agent
+file_pattern: "{tool_name}.md"
+operation_mode: upsert
+description: "工具使用经验 - 最佳场景、参数调优、常见失败"
+fields:
+  - name: tool_name
+    type: string
+    merge_op: immutable
+    description: "工具名称"
+  - name: call_count
+    type: int
+    merge_op: sum
+    init_value: 0
+    description: "调用次数"
+  - name: success_count
+    type: int
+    merge_op: sum
+    init_value: 0
+    description: "成功次数"
+  - name: when_to_use
+    type: string
+    merge_op: patch
+    description: "最佳使用场景"
+  - name: guidelines
+    type: string
+    merge_op: patch
+    description: "使用指南"
+  - name: common_failures
+    type: string
+    merge_op: append
+    description: "常见失败及解决"
+enabled: true

@@ -1,0 +1,27 @@
+name: project
+space: user
+file_pattern: "{project_name}.md"
+operation_mode: upsert
+description: "项目知识 - 架构决策、目录结构、技术栈"
+fields:
+  - name: project_name
+    type: string
+    merge_op: immutable
+    description: "项目名称"
+  - name: tech_stack
+    type: list
+    merge_op: append
+    description: "技术栈"
+  - name: architecture
+    type: string
+    merge_op: patch
+    description: "架构描述"
+  - name: directory_structure
+    type: string
+    merge_op: patch
+    description: "目录结构说明"
+  - name: key_decisions
+    type: string
+    merge_op: append
+    description: "关键决策记录"
+enabled: true

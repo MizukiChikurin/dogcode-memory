@@ -1,0 +1,27 @@
+name: profile
+space: user
+file_pattern: "profile.md"
+operation_mode: upsert
+description: "用户画像 - 编码习惯、常用语言、项目偏好"
+fields:
+  - name: coding_languages
+    type: list
+    merge_op: append
+    description: "常用编程语言"
+  - name: expertise_areas
+    type: list
+    merge_op: append
+    description: "专长领域"
+  - name: preferred_frameworks
+    type: list
+    merge_op: append
+    description: "常用框架"
+  - name: work_style
+    type: string
+    merge_op: patch
+    description: "工作风格偏好"
+  - name: communication_preferences
+    type: string
+    merge_op: patch
+    description: "沟通偏好"
+enabled: true
