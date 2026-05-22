@@ -86,27 +86,25 @@ class MemoryStore:
 
         Args:
             type_name: 记忆类型名称，如 "profile", "preferences"
-            space: 空间过滤，"user" 或 "agent"，None 表示不过滤
+            space: 空间过滤，"user" 或 "agent"，None 表示在 user 和 agent 下都搜索
 
         Returns:
             URI 列表（相对 base_dir 的路径）
         """
         results: list[str] = []
-        search_dir = self._base_dir
-        if space:
-            search_dir = search_dir / space
-        search_dir = search_dir / type_name
+        spaces = [space] if space else ["user", "agent"]
 
-        if not search_dir.exists():
-            return results
-
-        for path in search_dir.rglob("*.md"):
-            # 排除隐藏文件和归档文件
-            if path.name.startswith(".") or path.name.startswith("_"):
+        for sp in spaces:
+            search_dir = self._base_dir / sp / type_name
+            if not search_dir.exists():
                 continue
-            # 计算相对 base_dir 的 URI
-            rel = path.relative_to(self._base_dir)
-            results.append(str(rel).replace("\\", "/"))
+            for path in search_dir.rglob("*.md"):
+                # 排除隐藏文件和归档文件
+                if path.name.startswith(".") or path.name.startswith("_"):
+                    continue
+                # 计算相对 base_dir 的 URI
+                rel = path.relative_to(self._base_dir)
+                results.append(str(rel).replace("\\", "/"))
         return sorted(results)
 
     def move(self, source_uri: str, target_uri: str) -> bool:
@@ -177,7 +175,11 @@ class MemoryStore:
                 rel = path.relative_to(self._base_dir)
                 parts = str(rel).split(os.sep)
                 if len(parts) >= 2:
-                    type_key = parts[1] if parts[0] in ("user", "agent") else parts[0]
+                    # 路径结构: user/profile.md 或 user/preferences/style.md
+                    if parts[0] in ("user", "agent"):
+                        type_key = parts[1].replace(".md", "")
+                    else:
+                        type_key = parts[0].replace(".md", "")
                     type_counts[type_key] = type_counts.get(type_key, 0) + 1
 
         return {

@@ -31,6 +31,7 @@ class MemoryData:
         source_sessions: list[str] | None = None,
         content: str = "",
         fields: dict[str, Any] | None = None,
+        abstract: str = "",
     ):
         self.uri = uri
         self.type = type
@@ -41,6 +42,7 @@ class MemoryData:
         self.source_sessions = source_sessions or []
         self.content = content
         self.fields = fields or {}
+        self.abstract = abstract
 
 
 def serialize_memory(
@@ -103,19 +105,26 @@ def deserialize_memory(content: str) -> MemoryData:
     """
     metadata, body = parse_metadata(content)
 
+    def _to_str(value):
+        """将 YAML 解析的 datetime 等对象转回字符串。"""
+        if isinstance(value, datetime):
+            return value.isoformat()
+        return value if value is not None else ""
+
     return MemoryData(
-        uri=metadata.get("uri", ""),
-        type=metadata.get("type", ""),
-        space=metadata.get("space", ""),
-        created_at=metadata.get("created_at", ""),
-        updated_at=metadata.get("updated_at", ""),
+        uri=_to_str(metadata.get("uri")),
+        type=_to_str(metadata.get("type")),
+        space=_to_str(metadata.get("space")),
+        created_at=_to_str(metadata.get("created_at")),
+        updated_at=_to_str(metadata.get("updated_at")),
         active_count=metadata.get("active_count", 0),
         source_sessions=metadata.get("source_sessions", []),
         content=body,
         fields={k: v for k, v in metadata.items() if k not in {
             "uri", "type", "space", "created_at", "updated_at",
-            "active_count", "source_sessions"
+            "active_count", "source_sessions", "abstract"
         }},
+        abstract=_to_str(metadata.get("abstract")),
     )
 
 

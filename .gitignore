@@ -44,6 +44,7 @@ venv.bak/
 .coverage
 htmlcov/
 .tox/
+tests/
 
 # OS
 .DS_Store

@@ -45,7 +45,7 @@ def hotness_score(
         age_days = 0.0
 
     if half_life_days <= 0:
-        recency = 1.0
+        recency = 0.0
     else:
         lambda_val = math.log(2) / half_life_days
         recency = math.exp(-lambda_val * max(0, age_days))
@@ -144,17 +144,18 @@ class MemoryArchiver:
 
     def list_archived(self) -> list[str]:
         """列出所有已归档的记忆 URI。"""
-        # 归档文件存储在 _archive/ 子目录下
+        # 归档文件存储在 user/_archive/ 和 agent/_archive/ 子目录下
         archived: list[str] = []
         base = self._store.base_dir
-        archive_dir = base / "_archive"
-        if not archive_dir.exists():
+        if not base.exists():
             return archived
 
-        for path in archive_dir.rglob("*.md"):
-            rel = path.relative_to(base)
-            archived.append(str(rel).replace("\\", "/"))
-        return archived
+        for path in base.rglob("*.md"):
+            # 只收集路径中包含 _archive 的文件
+            rel = str(path.relative_to(base)).replace("\\", "/")
+            if "_archive" in rel and not path.name.startswith("."):
+                archived.append(rel)
+        return sorted(archived)
 
     @staticmethod
     def _to_archive_uri(uri: str) -> str:

@@ -65,8 +65,8 @@ class MemoryTypeSchema:
     """记忆类型 Schema 定义，对应一个 YAML 模板。"""
 
     name: str
-    space: str  # "user" 或 "agent"
-    file_pattern: str  # 文件路径模式，如 "{name}.md"
+    space: str = "user"  # "user" 或 "agent"
+    file_pattern: str = "{name}.md"  # 文件路径模式
     operation_mode: OperationMode = OperationMode.UPSERT
     fields: list[MemoryField] = field(default_factory=list)
     description: str = ""
