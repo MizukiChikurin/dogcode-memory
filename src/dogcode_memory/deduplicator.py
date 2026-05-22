@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -181,8 +183,6 @@ Decide: skip, create, or merge?"""
             content = resp.content if hasattr(resp, "content") else str(resp)
 
             # 解析 JSON 决策
-            import json
-            # 尝试提取 JSON
             decision_data = self._parse_json_decision(content)
             if decision_data:
                 return DedupDecision(
@@ -202,7 +202,6 @@ Decide: skip, create, or merge?"""
     @staticmethod
     def _parse_json_decision(text: str) -> dict[str, str] | None:
         """从文本中解析 JSON 决策。"""
-        import re
         text = text.strip()
 
         # 尝试直接解析

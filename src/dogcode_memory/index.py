@@ -169,6 +169,28 @@ class MemoryIndex:
             return self._vector_search(query, type_filter, limit)
         return self._fts_search(query, type_filter, limit)
 
+    def search_similar(
+        self,
+        query_text: str,
+        type_filter: str | None = None,
+        limit: int = 5,
+    ) -> list[tuple[str, float]]:
+        """
+        搜索相似记忆 —— `SimilarityProvider` 协议方法。
+
+        是 `search()` 的别名，参数签名与 `SimilarityProvider` 保持一致，
+        供 `MemoryDeduplicator` 在去重阶段调用。
+
+        Args:
+            query_text: 查询文本
+            type_filter: 可选的类型过滤
+            limit: 返回数量限制
+
+        Returns:
+            (uri, score) 列表，按相关性排序
+        """
+        return self.search(query=query_text, type_filter=type_filter, limit=limit)
+
     def _vector_search(
         self,
         query: str,

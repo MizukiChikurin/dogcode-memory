@@ -30,6 +30,11 @@ from dogcode_memory.retriever import MemoryRetriever, MemoryResult
 from dogcode_memory.lifecycle import hotness_score, MemoryArchiver
 from dogcode_memory.injector import MemoryInjector
 from dogcode_memory.pipeline import MemoryPipeline
+from dogcode_memory.adapter import (
+    ReuleauxLLMAdapter,
+    ReuleauxEmbeddingAdapter,
+    adapt_llm,
+)
 
 __all__ = [
     # 配置
@@ -75,4 +80,8 @@ __all__ = [
     "MemoryInjector",
     # 管线
     "MemoryPipeline",
+    # 适配器
+    "ReuleauxLLMAdapter",
+    "ReuleauxEmbeddingAdapter",
+    "adapt_llm",
 ]
