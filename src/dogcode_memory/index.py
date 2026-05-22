@@ -1,4 +1,10 @@
-"""语义索引 - SQLite + 可选 Embedding 的向量索引。"""
+"""语义索引 - SQLite + 可选 Embedding 的向量索引。
+
+并发安全说明：
+- SQLite 启用 WAL（Write-Ahead Logging）模式，支持读者与写者并发。
+- WAL 模式下，读取不会被写入阻塞，写入也不会被读取阻塞。
+- 多进程并发写入时 SQLite 内部自动序列化，无需额外锁。
+"""
 
 from __future__ import annotations
 
@@ -32,7 +38,13 @@ class MemoryRecord:
 
 
 class MemoryIndex:
-    """记忆索引 - 基于 SQLite 的语义索引。"""
+    """记忆索引 - 基于 SQLite 的语义索引。
+
+    启用 WAL 模式以支持并发读写：
+    - 读者不会阻塞写者
+    - 写者不会阻塞读者
+    - 多进程写入由 SQLite 内部自动序列化
+    """
 
     def __init__(
         self,
@@ -55,10 +67,16 @@ class MemoryIndex:
         self._init_db()
 
     def _init_db(self) -> None:
-        """初始化数据库表结构。"""
+        """初始化数据库表结构并启用 WAL 模式。"""
         self._ensure_dir(Path(self._db_path).parent)
         with sqlite3.connect(self._db_path) as conn:
-            # 主表
+            # 启用 WAL 模式，支持读写并发
+            conn.execute("PRAGMA journal_mode=WAL")
+            # 自动检查点间隔：1000 页（平衡性能与恢复速度）
+            conn.execute("PRAGMA wal_autocheckpoint=1000")
+            # 同步模式 NORMAL：WAL 模式下安全且更快
+            conn.execute("PRAGMA synchronous=NORMAL")
+
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS memories (
                     uri TEXT PRIMARY KEY,
@@ -69,7 +87,6 @@ class MemoryIndex:
                     embedding_json TEXT
                 )
             """)
-            # FTS5 全文搜索表（用于 fallback）
             conn.execute("""
                 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
                     uri, abstract, content,
@@ -77,7 +94,6 @@ class MemoryIndex:
                     content_rowid='rowid'
                 )
             """)
-            # 触发器保持 FTS 同步
             conn.execute("""
                 CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
                     INSERT INTO memories_fts(rowid, uri, abstract, content)
@@ -98,7 +114,6 @@ class MemoryIndex:
                     VALUES (new.rowid, new.uri, new.abstract, new.content);
                 END
             """)
-            # 访问日志表（用于热度计算）
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS access_log (
                     uri TEXT,
@@ -115,15 +130,7 @@ class MemoryIndex:
         content: str,
         updated_at: str = "",
     ) -> None:
-        """
-        索引单条记忆。
-
-        Args:
-            uri: 记忆 URI
-            abstract: 摘要文本
-            content: 完整内容
-            updated_at: 更新时间
-        """
+        """索引单条记忆。"""
         embedding = None
         if self._embedding_provider:
             text = f"{abstract} {content[:500]}".strip()
@@ -156,14 +163,6 @@ class MemoryIndex:
         搜索记忆。
 
         优先使用向量搜索（如果有 embedding provider），否则回退到 FTS。
-
-        Args:
-            query: 查询文本
-            type_filter: 可选的类型过滤（通过 URI 前缀匹配）
-            limit: 返回数量限制
-
-        Returns:
-            (uri, score) 列表，按相关性排序
         """
         if self._embedding_provider:
             return self._vector_search(query, type_filter, limit)
@@ -175,20 +174,7 @@ class MemoryIndex:
         type_filter: str | None = None,
         limit: int = 5,
     ) -> list[tuple[str, float]]:
-        """
-        搜索相似记忆 —— `SimilarityProvider` 协议方法。
-
-        是 `search()` 的别名，参数签名与 `SimilarityProvider` 保持一致，
-        供 `MemoryDeduplicator` 在去重阶段调用。
-
-        Args:
-            query_text: 查询文本
-            type_filter: 可选的类型过滤
-            limit: 返回数量限制
-
-        Returns:
-            (uri, score) 列表，按相关性排序
-        """
+        """搜索相似记忆 —— SimilarityProvider 协议方法。"""
         return self.search(query=query_text, type_filter=type_filter, limit=limit)
 
     def _vector_search(
@@ -228,7 +214,6 @@ class MemoryIndex:
         limit: int,
     ) -> list[tuple[str, float]]:
         """FTS5 全文搜索（fallback）。"""
-        # 转义 FTS 特殊字符
         safe_query = query.replace('"', '""')
         with sqlite3.connect(self._db_path) as conn:
             cursor = conn.execute(
@@ -242,9 +227,8 @@ class MemoryIndex:
                 """,
                 (safe_query, limit),
             )
-            results = [(row[0], max(0.0, 1.0 + row[1])) for row in cursor]  # rank 为负数
+            results = [(row[0], max(0.0, 1.0 + row[1])) for row in cursor]
 
-        # 如果 FTS 无结果，尝试 LIKE 模糊匹配
         if not results:
             with sqlite3.connect(self._db_path) as conn:
                 pattern = f"%{query}%"
@@ -254,20 +238,13 @@ class MemoryIndex:
                 )
                 results = [(row[0], 0.5) for row in cursor]
 
-        # 应用类型过滤
         if type_filter:
             results = [(uri, score) for uri, score in results if type_filter in uri]
 
         return results
 
     def update_activity(self, uri: str, query: str = "") -> None:
-        """
-        更新记忆的访问计数。
-
-        Args:
-            uri: 被访问的记忆 URI
-            query: 触发访问的查询文本（可选）
-        """
+        """更新记忆的访问计数。"""
         with sqlite3.connect(self._db_path) as conn:
             conn.execute(
                 "UPDATE memories SET active_count = active_count + 1 WHERE uri = ?",

@@ -1,4 +1,10 @@
-"""管线编排 - 将记忆模块组件编排为完整的会话生命周期管线。"""
+"""管线编排 - 将记忆模块组件编排为完整的会话生命周期管线。
+
+并发安全说明：
+- on_session_end 中的写操作受 MemoryStore 文件锁保护，
+  确保多会话同时结束不会导致文件写入冲突。
+- SQLite 索引通过 WAL 模式天然支持读写并发，无需额外锁。
+"""
 
 from __future__ import annotations
 
@@ -22,7 +28,7 @@ class MemoryPipeline:
     提供统一的接口，便于 ReuleauxCoder-ezcode 集成：
     - 会话启动：注入历史记忆
     - 会话运行：可选的实时提取
-    - 会话结束：归档 + 异步提取记忆
+    - 会话结束：归档 + 提取记忆（写操作受文件锁保护）
     """
 
     def __init__(
@@ -88,7 +94,6 @@ class MemoryPipeline:
         if not cfg.storage_dir:
             cfg.storage_dir = storage_dir
 
-        # 创建组件
         store = MemoryStore(cfg.storage_dir)
         registry = MemoryTypeRegistry()
 
@@ -130,6 +135,8 @@ class MemoryPipeline:
         """
         会话启动：检索并注入相关历史记忆。
 
+        读操作无需加锁（文件原子读 + SQLite WAL 模式）。
+
         Args:
             session_id: 新会话 ID
             context: 会话上下文描述
@@ -149,6 +156,8 @@ class MemoryPipeline:
         """
         会话结束：提取长期记忆并更新存储。
 
+        整个写入流程受文件锁保护，防止多会话同时结束造成冲突。
+
         Args:
             session_id: 会话 ID
             messages: 会话消息列表
@@ -159,10 +168,10 @@ class MemoryPipeline:
         if not self._enabled or not messages:
             return {"extracted": 0, "created": 0, "merged": 0, "skipped": 0}
 
-        # 提取候选记忆
+        # 提取候选记忆（无需锁，纯内存操作）
         candidates = self._extractor.extract(session_id, messages)
 
-        # 去重并生成操作
+        # 去重并生成操作（无需锁，纯内存操作）
         operations: list[MemoryOperation] = []
         stats = {"extracted": len(candidates), "created": 0, "merged": 0, "skipped": 0}
 
@@ -173,7 +182,6 @@ class MemoryPipeline:
                 stats["skipped"] += 1
                 continue
 
-            # 生成 URI
             uri = self._updater.generate_uri(
                 memory_type=candidate.type,
                 name=candidate.abstract[:40],
@@ -204,21 +212,21 @@ class MemoryPipeline:
                 operations.append(MemoryOperation(op_type="write", uri=uri, candidate=candidate_dict))
                 stats["created"] += 1
 
-        # 执行操作
-        modified = self._updater.apply_operations(operations)
+        # 持有文件锁执行所有写入操作（文件存储 + 索引更新）
+        with self._store.lock:
+            modified = self._updater.apply_operations(operations)
 
-        # 更新索引
-        for uri in modified:
-            content = self._store.read(uri)
-            if content:
-                from dogcode_memory.format import deserialize_memory
-                memory = deserialize_memory(content)
-                self._index.index_memory(
-                    uri=uri,
-                    abstract=memory.abstract or memory.type,
-                    content=memory.content,
-                    updated_at=memory.updated_at,
-                )
+            for uri in modified:
+                content = self._store.read(uri)
+                if content:
+                    from dogcode_memory.format import deserialize_memory
+                    memory = deserialize_memory(content)
+                    self._index.index_memory(
+                        uri=uri,
+                        abstract=memory.abstract or memory.type,
+                        content=memory.content,
+                        updated_at=memory.updated_at,
+                    )
 
         return stats
 
@@ -226,17 +234,23 @@ class MemoryPipeline:
         """
         运行维护任务：冷记忆归档、索引优化。
 
+        归档操作受文件锁保护。
+
         Returns:
             维护结果统计
         """
         if not self._enabled:
             return {"archived": 0}
 
-        archived = self._archiver.archive_cold_memories()
+        with self._store.lock:
+            archived = self._archiver.archive_cold_memories()
         return {"archived": len(archived), "archived_uris": archived}
 
     def get_stats(self) -> dict[str, Any]:
-        """获取管线统计信息。"""
+        """获取管线统计信息。
+
+        读操作无需加锁。
+        """
         return {
             "enabled": self._enabled,
             "store": self._store.get_stats(),
