@@ -92,6 +92,4 @@ maintenance = pipeline.run_maintenance()
 - Python >= 3.10
 - PyYAML >= 6.0
 
-## 集成
 
-详见 `E:\DogCode\plans\dogcode-memory-design.md`。

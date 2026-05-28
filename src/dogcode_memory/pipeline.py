@@ -11,6 +11,10 @@ from __future__ import annotations
 from typing import Any
 
 from dogcode_memory.config import MemoryConfig
+from dogcode_memory.context.archiver import SessionArchiver
+from dogcode_memory.context.compression_enhanced import generate_structured_summary
+from dogcode_memory.context.restorer import RestoreResult, SessionRestorer
+from dogcode_memory.context.summary_cache import SummaryCache
 from dogcode_memory.deduplicator import MemoryDeduplicator
 from dogcode_memory.extractor import CandidateMemory, MemoryExtractor
 from dogcode_memory.index import MemoryIndex
@@ -41,6 +45,8 @@ class MemoryPipeline:
         retriever: MemoryRetriever,
         injector: MemoryInjector,
         archiver: MemoryArchiver,
+        session_archiver: SessionArchiver | None = None,
+        session_restorer: SessionRestorer | None = None,
         config: MemoryConfig | None = None,
     ):
         """
@@ -54,7 +60,9 @@ class MemoryPipeline:
             updater: 更新器
             retriever: 检索器
             injector: 注入器
-            archiver: 归档器
+            archiver: 冷记忆归档器（生命周期管理）
+            session_archiver: 会话归档器（上下文管理）
+            session_restorer: 会话恢复器
             config: 记忆配置
         """
         self._store = store
@@ -65,6 +73,8 @@ class MemoryPipeline:
         self._retriever = retriever
         self._injector = injector
         self._archiver = archiver
+        self._session_archiver = session_archiver
+        self._session_restorer = session_restorer
         self._config = config or MemoryConfig()
         self._enabled = self._config.enabled
 
@@ -115,6 +125,19 @@ class MemoryPipeline:
         injector = MemoryInjector(retriever=retriever, config=cfg)
         archiver = MemoryArchiver(store=store, config=cfg)
 
+        # 会话归档与恢复
+        import os
+        archive_dir = os.path.join(cfg.storage_dir, "sessions")
+        session_archiver = SessionArchiver(
+            archive_dir=archive_dir,
+            summary_fn=None,
+            structured_summary_fn=generate_structured_summary,
+        )
+        session_restorer = SessionRestorer(
+            archiver=session_archiver,
+            token_budget=8000,
+        )
+
         return cls(
             store=store,
             index=index,
@@ -124,6 +147,8 @@ class MemoryPipeline:
             retriever=retriever,
             injector=injector,
             archiver=archiver,
+            session_archiver=session_archiver,
+            session_restorer=session_restorer,
             config=cfg,
         )
 
@@ -246,13 +271,112 @@ class MemoryPipeline:
             archived = self._archiver.archive_cold_memories()
         return {"archived": len(archived), "archived_uris": archived}
 
+    def archive_session(
+        self,
+        session_id: str,
+        messages: list[dict[str, Any]],
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """
+        将会话消息归档到存储。
+
+        归档后旧消息可从活跃列表中移除，仅保留归档摘要用于恢复。
+
+        Args:
+            session_id: 会话 ID
+            messages: 待归档的消息列表
+            metadata: 可选的会话元数据
+
+        Returns:
+            归档结果信息
+        """
+        if not self._enabled or not messages or not self._session_archiver:
+            return {"archived": False, "reason": "disabled_or_empty"}
+
+        try:
+            record = self._session_archiver.archive(
+                session_id=session_id,
+                messages=messages,
+                metadata=metadata,
+            )
+            return {
+                "archived": True,
+                "archive_id": record.archive_id,
+                "message_count": record.message_count,
+                "token_count": record.token_count,
+                "summary_length": len(record.summary),
+            }
+        except Exception as e:
+            return {"archived": False, "reason": str(e)}
+
+    def restore_session(
+        self,
+        session_id: str,
+        active_messages: list[dict[str, Any]] | None = None,
+        query: str = "",
+    ) -> RestoreResult:
+        """
+        从归档和相关记忆中恢复会话上下文。
+
+        Args:
+            session_id: 会话 ID
+            active_messages: 当前已加载的活跃消息（如从 SessionStore 加载的）
+            query: 检索记忆的查询文本
+
+        Returns:
+            RestoreResult，包含组装好的消息列表
+        """
+        if not self._enabled or not self._session_restorer:
+            return RestoreResult(
+                messages=active_messages or [],
+                info={"reason": "disabled_or_no_restorer"},
+            )
+
+        if active_messages:
+            return self._session_restorer.restore_with_active_messages(
+                session_id=session_id,
+                active_messages=active_messages,
+                query=query,
+                memory_retriever=self._retriever,
+            )
+
+        return self._session_restorer.restore(
+            session_id=session_id,
+            query=query,
+            memory_retriever=self._retriever,
+        )
+
+    def get_session_archives(self, session_id: str) -> list[dict[str, Any]]:
+        """
+        获取会话的所有归档记录（只读）。
+
+        Args:
+            session_id: 会话 ID
+
+        Returns:
+            归档记录字典列表
+        """
+        if not self._session_archiver:
+            return []
+        records = self._session_archiver.load_archives(session_id)
+        return [r.to_dict() for r in records]
+
+    def delete_session_archive(self, session_id: str, archive_id: str) -> bool:
+        """删除指定会话归档。"""
+        if not self._session_archiver:
+            return False
+        return self._session_archiver.delete_archive(session_id, archive_id)
+
     def get_stats(self) -> dict[str, Any]:
         """获取管线统计信息。
 
         读操作无需加锁。
         """
-        return {
+        stats = {
             "enabled": self._enabled,
             "store": self._store.get_stats(),
             "index": self._index.get_stats(),
         }
+        if self._session_archiver:
+            stats["sessions_with_archives"] = len(self._session_archiver.list_session_ids())
+        return stats

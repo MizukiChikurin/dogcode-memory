@@ -36,6 +36,18 @@ from dogcode_memory.adapter import (
     adapt_llm,
 )
 
+# 上下文管理子模块（Phase 1）
+from dogcode_memory.context import (
+    ArchiveRecord,
+    ArchiveWriter,
+    SessionArchiver,
+    SessionRestorer,
+    SummaryCache,
+    compute_message_hash,
+    ArchiveCompressStrategy,
+    generate_structured_summary,
+)
+
 __all__ = [
     # 配置
     "MemoryConfig",
@@ -84,4 +96,13 @@ __all__ = [
     "ReuleauxLLMAdapter",
     "ReuleauxEmbeddingAdapter",
     "adapt_llm",
+    # 上下文管理（Phase 1 新增）
+    "ArchiveRecord",
+    "ArchiveWriter",
+    "SessionArchiver",
+    "SessionRestorer",
+    "SummaryCache",
+    "compute_message_hash",
+    "ArchiveCompressStrategy",
+    "generate_structured_summary",
 ]
