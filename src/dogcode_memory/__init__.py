@@ -48,6 +48,20 @@ from dogcode_memory.context import (
     generate_structured_summary,
 )
 
+# 异步任务调度（Phase 2）
+from dogcode_memory.async_ops import AsyncTask, AsyncTaskPool, ExtractionTask
+
+# 零侵入接入封装（Phase 5）
+from dogcode_memory.hooks import MemoryLifecycleHook, register_memory_hooks
+from dogcode_memory.monkey_patch import (
+    install_memory,
+    uninstall_memory,
+    patch_chat_method,
+    patch_reset_method,
+    patch_message_builder,
+    patch_session_save,
+)
+
 __all__ = [
     # 配置
     "MemoryConfig",
@@ -105,4 +119,17 @@ __all__ = [
     "compute_message_hash",
     "ArchiveCompressStrategy",
     "generate_structured_summary",
+    # 异步任务（Phase 2 新增）
+    "AsyncTask",
+    "AsyncTaskPool",
+    "ExtractionTask",
+    # 零侵入接入（Phase 5 新增）
+    "MemoryLifecycleHook",
+    "register_memory_hooks",
+    "install_memory",
+    "uninstall_memory",
+    "patch_chat_method",
+    "patch_reset_method",
+    "patch_message_builder",
+    "patch_session_save",
 ]

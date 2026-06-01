@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from dogcode_memory.async_ops import AsyncTask, AsyncTaskPool, ExtractionTask
 from dogcode_memory.config import MemoryConfig
 from dogcode_memory.context.archiver import SessionArchiver
 from dogcode_memory.context.compression_enhanced import generate_structured_summary
@@ -47,6 +48,7 @@ class MemoryPipeline:
         archiver: MemoryArchiver,
         session_archiver: SessionArchiver | None = None,
         session_restorer: SessionRestorer | None = None,
+        async_pool: AsyncTaskPool | None = None,
         config: MemoryConfig | None = None,
     ):
         """
@@ -63,6 +65,7 @@ class MemoryPipeline:
             archiver: 冷记忆归档器（生命周期管理）
             session_archiver: 会话归档器（上下文管理）
             session_restorer: 会话恢复器
+            async_pool: 异步任务池，None 时延迟创建
             config: 记忆配置
         """
         self._store = store
@@ -75,6 +78,7 @@ class MemoryPipeline:
         self._archiver = archiver
         self._session_archiver = session_archiver
         self._session_restorer = session_restorer
+        self._async_pool = async_pool
         self._config = config or MemoryConfig()
         self._enabled = self._config.enabled
 
@@ -138,6 +142,8 @@ class MemoryPipeline:
             token_budget=8000,
         )
 
+        async_pool = AsyncTaskPool(max_workers=2)
+
         return cls(
             store=store,
             index=index,
@@ -149,6 +155,7 @@ class MemoryPipeline:
             archiver=archiver,
             session_archiver=session_archiver,
             session_restorer=session_restorer,
+            async_pool=async_pool,
             config=cfg,
         )
 
@@ -379,4 +386,127 @@ class MemoryPipeline:
         }
         if self._session_archiver:
             stats["sessions_with_archives"] = len(self._session_archiver.list_session_ids())
+        if self._async_pool:
+            stats["pending_tasks"] = len(self._async_pool.get_pending())
         return stats
+
+    # ───────────────────────────────────────────────
+    # Phase 2: 异步提取
+    # ───────────────────────────────────────────────
+
+    def on_session_end_async(
+        self,
+        session_id: str,
+        messages: list[dict[str, Any]],
+    ) -> str:
+        """
+        异步触发会话结束的记忆提取。
+
+        将提取任务提交到后台线程池，立即返回任务 ID，
+        不阻塞调用方。提取完成后可通过 wait_for_task 查询结果。
+
+        Args:
+            session_id: 会话 ID
+            messages: 会话消息列表
+
+        Returns:
+            任务 ID，可用于后续查询
+        """
+        if not self._enabled or not messages:
+            return ""
+
+        if self._async_pool is None:
+            self._async_pool = AsyncTaskPool(max_workers=2)
+
+        task = self._async_pool.submit(
+            task_type="memory_extraction",
+            fn=self._do_session_end,
+            payload={"session_id": session_id},
+            session_id=session_id,
+            messages=messages,
+        )
+        return task.task_id
+
+    def _do_session_end(
+        self,
+        session_id: str,
+        messages: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """后台执行会话结束提取的内部方法。"""
+        return self.on_session_end(session_id, messages)
+
+    def get_pending_tasks(self) -> list[str]:
+        """
+        获取正在执行中的任务 ID 列表。
+
+        Returns:
+            任务 ID 列表
+        """
+        if self._async_pool is None:
+            return []
+        return self._async_pool.get_pending()
+
+    def get_task_status(self, task_id: str) -> dict[str, Any] | None:
+        """
+        获取指定任务的当前状态。
+
+        Args:
+            task_id: 任务 ID
+
+        Returns:
+            任务状态字典，任务不存在返回 None
+        """
+        if self._async_pool is None:
+            return None
+        task = self._async_pool.get_task(task_id)
+        return task.to_dict() if task else None
+
+    def wait_for_task(
+        self,
+        task_id: str,
+        timeout: float | None = None,
+    ) -> dict[str, Any] | None:
+        """
+        等待指定任务完成并返回结果。
+
+        Args:
+            task_id: 任务 ID
+            timeout: 等待超时（秒），None 表示无限等待
+
+        Returns:
+            任务结果字典（包含 result 和 error），任务不存在返回 None
+        """
+        if self._async_pool is None:
+            return None
+        task = self._async_pool.wait_for(task_id, timeout=timeout)
+        if task is None:
+            return None
+        return {
+            "task_id": task.task_id,
+            "task_type": task.task_type,
+            "is_done": task.is_done(),
+            "has_error": task.error is not None,
+            "error_message": str(task.error) if task.error else None,
+            "result": task.result,
+        }
+
+    def wait_all_tasks(self, timeout: float | None = None) -> None:
+        """
+        等待所有已提交的异步任务完成。
+
+        Args:
+            timeout: 等待超时（秒）
+        """
+        if self._async_pool is not None:
+            self._async_pool.wait_all(timeout=timeout)
+
+    def shutdown_async_pool(self, wait: bool = True) -> None:
+        """
+        关闭异步任务池，释放线程资源。
+
+        Args:
+            wait: 是否等待所有任务完成后再关闭
+        """
+        if self._async_pool is not None:
+            self._async_pool.shutdown(wait=wait)
+            self._async_pool = None

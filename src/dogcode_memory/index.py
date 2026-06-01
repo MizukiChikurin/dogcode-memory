@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -64,7 +65,11 @@ class MemoryIndex:
         self._embedding_provider = embedding_provider
         self._dimension = dimension
         self._embedding_cache: dict[str, list[float]] = {}
+        # 内存中的向量索引：uri -> embedding
+        self._embedding_index: dict[str, list[float]] = {}
+        self._index_lock = threading.RLock()
         self._init_db()
+        self._preload_embeddings()
 
     def _init_db(self) -> None:
         """初始化数据库表结构并启用 WAL 模式。"""
@@ -123,6 +128,22 @@ class MemoryIndex:
             """)
             conn.commit()
 
+    def _preload_embeddings(self) -> None:
+        """启动时将所有 embedding 从 SQLite 加载到内存字典。"""
+        if not self._embedding_provider:
+            return
+        with sqlite3.connect(self._db_path) as conn:
+            cursor = conn.execute("SELECT uri, embedding_json FROM memories WHERE embedding_json IS NOT NULL")
+            for row in cursor:
+                uri, emb_json = row
+                try:
+                    embedding = json.loads(emb_json)
+                    if embedding and len(embedding) == self._dimension:
+                        with self._index_lock:
+                            self._embedding_index[uri] = embedding
+                except Exception:
+                    continue
+
     def index_memory(
         self,
         uri: str,
@@ -130,7 +151,7 @@ class MemoryIndex:
         content: str,
         updated_at: str = "",
     ) -> None:
-        """索引单条记忆。"""
+        """索引单条记忆，同步维护内存向量索引。"""
         embedding = None
         if self._embedding_provider:
             text = f"{abstract} {content[:500]}".strip()
@@ -152,6 +173,13 @@ class MemoryIndex:
                 (uri, abstract, content, 0, updated_at or _now_iso(), embedding_json),
             )
             conn.commit()
+
+        # 同步更新内存索引
+        with self._index_lock:
+            if embedding:
+                self._embedding_index[uri] = embedding
+            else:
+                self._embedding_index.pop(uri, None)
 
     def search(
         self,
@@ -183,26 +211,27 @@ class MemoryIndex:
         type_filter: str | None,
         limit: int,
     ) -> list[tuple[str, float]]:
-        """向量相似度搜索。"""
+        """向量相似度搜索（内存遍历优化版）。
+
+        从内存中的 _embedding_index 字典遍历计算余弦相似度，
+        避免每次搜索都对 SQLite 执行全表扫描。
+        若内存索引为空，自动回退到 FTS 搜索。
+        """
         query_embedding = self._get_or_create_embedding(query)
         if not query_embedding:
             return self._fts_search(query, type_filter, limit)
 
         results: list[tuple[str, float]] = []
-        with sqlite3.connect(self._db_path) as conn:
-            cursor = conn.execute("SELECT uri, abstract, content, embedding_json FROM memories")
-            for row in cursor:
-                uri, abstract, content, emb_json = row
-                if type_filter and type_filter not in uri:
-                    continue
-                if not emb_json:
-                    continue
-                try:
-                    mem_embedding = json.loads(emb_json)
-                    score = _cosine_similarity(query_embedding, mem_embedding)
-                    results.append((uri, score))
-                except Exception:
-                    continue
+        with self._index_lock:
+            index_snapshot = dict(self._embedding_index)
+
+        for uri, mem_embedding in index_snapshot.items():
+            if type_filter and type_filter not in uri:
+                continue
+            if len(mem_embedding) != self._dimension:
+                continue
+            score = _cosine_similarity(query_embedding, mem_embedding)
+            results.append((uri, score))
 
         results.sort(key=lambda x: x[1], reverse=True)
         return results[:limit]
@@ -257,24 +286,32 @@ class MemoryIndex:
             conn.commit()
 
     def remove(self, uri: str) -> None:
-        """从索引中移除记忆。"""
+        """从索引中移除记忆，同步清理内存向量索引。"""
         with sqlite3.connect(self._db_path) as conn:
             conn.execute("DELETE FROM memories WHERE uri = ?", (uri,))
             conn.execute("DELETE FROM access_log WHERE uri = ?", (uri,))
             conn.commit()
+
+        with self._index_lock:
+            self._embedding_index.pop(uri, None)
 
     def get_stats(self) -> dict[str, Any]:
         """获取索引统计信息。"""
         with sqlite3.connect(self._db_path) as conn:
             cursor = conn.execute("SELECT COUNT(*), SUM(active_count) FROM memories")
             total, total_access = cursor.fetchone()
-            return {
-                "total_memories": total or 0,
-                "total_access": total_access or 0,
-                "has_embedding": self._embedding_provider is not None,
-                "dimension": self._dimension,
-                "db_path": self._db_path,
-            }
+
+        with self._index_lock:
+            index_size = len(self._embedding_index)
+
+        return {
+            "total_memories": total or 0,
+            "total_access": total_access or 0,
+            "has_embedding": self._embedding_provider is not None,
+            "dimension": self._dimension,
+            "db_path": self._db_path,
+            "memory_index_size": index_size,
+        }
 
     def _get_or_create_embedding(self, text: str) -> list[float] | None:
         """获取或创建文本的 embedding，带缓存。"""
@@ -302,12 +339,21 @@ class MemoryIndex:
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
-    """计算两个向量的余弦相似度。"""
+    """计算两个向量的余弦相似度（优化版）。"""
     if len(a) != len(b):
         return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = sum(x * x for x in a) ** 0.5
-    norm_b = sum(x * x for x in b) ** 0.5
+
+    # 局部变量绑定减少属性查找开销
+    dot = 0.0
+    norm_a_sq = 0.0
+    norm_b_sq = 0.0
+    for x, y in zip(a, b):
+        dot += x * y
+        norm_a_sq += x * x
+        norm_b_sq += y * y
+
+    norm_a = norm_a_sq ** 0.5
+    norm_b = norm_b_sq ** 0.5
     if norm_a == 0 or norm_b == 0:
         return 0.0
     return dot / (norm_a * norm_b)
