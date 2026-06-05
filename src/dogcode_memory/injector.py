@@ -30,20 +30,27 @@ class MemoryInjector:
         self,
         session_context: str = "",
         query: str = "",
-    ) -> str:
+    ) -> dict[str, Any]:
         """
-        为新会话注入记忆，返回格式化的 System Prompt 增量。
+        为新会话注入记忆，返回结构化的注入结果。
 
         Args:
             session_context: 会话上下文描述（如当前项目、任务）
             query: 检索查询，空字符串时使用 session_context
 
         Returns:
-            格式化的记忆注入文本
+            注入结果字典：
+            {
+                "text": "格式化的记忆注入文本",
+                "uris": ["user/profile.md", ...],
+                "count": 3,
+                "total_tokens": 120,
+            }
+            无相关记忆时返回 {"text": "", "uris": [], "count": 0, "total_tokens": 0}
         """
         search_query = query or session_context
         if not search_query:
-            return ""
+            return {"text": "", "uris": [], "count": 0, "total_tokens": 0}
 
         # 检索相关记忆
         memories = self._retriever.retrieve(
@@ -53,16 +60,24 @@ class MemoryInjector:
         )
 
         if not memories:
-            return ""
+            return {"text": "", "uris": [], "count": 0, "total_tokens": 0}
 
         # 在预算内选择最相关的记忆
         selected = self._select_relevant_memories(memories, self._config.injection_token_budget)
 
         if not selected:
-            return ""
+            return {"text": "", "uris": [], "count": 0, "total_tokens": 0}
 
-        # 格式化为 System Prompt 增量
-        return self._format_memory_prompt(selected)
+        text = self._format_memory_prompt(selected)
+        uris = [m.uri for m in selected]
+        total_tokens = self._estimate_injection_tokens(text)
+
+        return {
+            "text": text,
+            "uris": uris,
+            "count": len(selected),
+            "total_tokens": total_tokens,
+        }
 
     def _select_relevant_memories(
         self,

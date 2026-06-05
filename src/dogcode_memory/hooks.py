@@ -111,14 +111,16 @@ class MemoryLifecycleHook(ObserverHook):
         metadata = getattr(context, "metadata", {}) or {}
         query = metadata.get("workspace_name", "")
 
-        memory_text = self.pipeline.on_session_start(
-            session_id=session_id,
+        injection_result = self.pipeline.on_session_start(
+            session_id=session_id or "",
             context=query,
         )
 
-        if memory_text:
+        if injection_result and injection_result.get("text"):
             # 将记忆注入到 metadata 中，供后续使用
-            metadata["dogcode_memory_injected"] = memory_text
+            metadata["dogcode_memory_injected"] = injection_result["text"]
+            metadata["dogcode_memory_uris"] = injection_result.get("uris", [])
+            metadata["dogcode_memory_count"] = injection_result.get("count", 0)
 
     def _on_session_save(self, context: SessionSaveContext) -> None:
         """会话保存时异步提取记忆。"""

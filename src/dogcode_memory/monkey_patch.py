@@ -107,15 +107,15 @@ def patch_message_builder(
             session_id = _get_session_id_from_loop(loop)
             query = _get_query_from_messages(messages)
 
-            memory_text = pipeline.on_session_start(
+            injection_result = pipeline.on_session_start(
                 session_id=session_id or "",
                 context=query,
             )
 
-            if memory_text:
-                # 在 system prompt 后追加记忆注入
-                messages = _inject_memory_into_messages(
-                    messages, memory_text, system_prompt_key
+            if injection_result and injection_result.get("text"):
+                # 将记忆合并到现有 system prompt，不插入额外消息
+                messages = _merge_memory_into_system_prompt(
+                    messages, injection_result, system_prompt_key
                 )
 
             setattr(loop, injected_attr, True)
@@ -215,14 +215,14 @@ def patch_chat_method(
             if args and isinstance(args[0], str):
                 query = args[0]
 
-            memory_text = pipeline.on_session_start(
+            injection_result = pipeline.on_session_start(
                 session_id=session_id or "",
                 context=query,
             )
 
             # 如果有 loop，将记忆注入 system prompt
             loop = getattr(agent, "loop", None)
-            if loop and memory_text:
+            if loop and injection_result and injection_result.get("text"):
                 # 标记 loop 已注入，避免重复
                 loop_injected = "_dogcode_memory_injected"
                 if hasattr(loop, loop_injected):
@@ -415,14 +415,22 @@ def _get_query_from_messages(messages: list[dict[str, Any]]) -> str:
     return ""
 
 
-def _inject_memory_into_messages(
+def _merge_memory_into_system_prompt(
     messages: list[dict[str, Any]],
-    memory_text: str,
+    injection_result: dict[str, Any],
     system_prompt_key: str = "system",
 ) -> list[dict[str, Any]]:
-    """在 system prompt 后追加记忆注入。"""
+    """将记忆内容合并到现有 system prompt，不插入额外消息。
+
+    在 system prompt 末尾添加 [memory_meta: count=N] 标记，
+    前端可通过解析该标记感知记忆注入状态。
+    """
+    memory_text = injection_result.get("text", "")
     if not memory_text:
         return messages
+
+    count = injection_result.get("count", 0)
+    meta_marker = f"\n\n[memory_meta: count={count}]"
 
     # 查找 system prompt 位置
     system_idx = -1
@@ -431,23 +439,29 @@ def _inject_memory_into_messages(
             system_idx = i
             break
 
+    new_messages = list(messages)
     if system_idx >= 0:
-        # 在 system prompt 后插入记忆
-        # 不修改原始 system prompt，而是追加一条新的 system 消息
-        injected = {
+        # 修改现有 system prompt，将记忆内容合并到末尾
+        original = new_messages[system_idx].get("content", "") or ""
+        new_content = (
+            f"{original}\n\n"
+            f"--- Cross-session context ---\n"
+            f"{memory_text}"
+            f"{meta_marker}"
+        )
+        new_messages[system_idx] = {
+            **new_messages[system_idx],
             "role": system_prompt_key,
-            "content": f"[Cross-session context]\n{memory_text}",
+            "content": new_content,
         }
-        # 在 system prompt 后插入
-        new_messages = list(messages)
-        new_messages.insert(system_idx + 1, injected)
-        return new_messages
+    else:
+        # 没有 system prompt，创建一条包含记忆的新 system 消息
+        new_messages.insert(0, {
+            "role": system_prompt_key,
+            "content": f"--- Cross-session context ---\n{memory_text}{meta_marker}",
+        })
 
-    # 没有 system prompt，在开头插入
-    return [
-        {"role": system_prompt_key, "content": f"[Cross-session context]\n{memory_text}"},
-        *messages,
-    ]
+    return new_messages
 
 
 def _extract_session_data(

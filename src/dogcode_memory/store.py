@@ -9,13 +9,23 @@
 
 from __future__ import annotations
 
+import logging
 import os
+import re
 import shutil
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Generator
 
 from filelock import FileLock
+
+# 创建模块级日志记录器
+logger = logging.getLogger(__name__)
+
+# URI 合法字符白名单：只允许字母、数字、下划线、连字符、点、斜杠
+_URI_SAFE_PATTERN = re.compile(r"^[a-zA-Z0-9_\-./]+$")
+# 禁止的路径遍历模式
+_URI_TRAVERSAL_PATTERN = re.compile(r"(^|/)\.\.(/|$)")
 
 
 class MemoryStore:
@@ -68,14 +78,29 @@ class MemoryStore:
 
         Returns:
             文件内容字符串，文件不存在时返回空字符串
+
+        Raises:
+            ValueError: URI 格式非法
         """
-        path = self._resolve_uri(uri)
+        try:
+            path = self._resolve_uri(uri)
+        except ValueError:
+            logger.warning("read: 非法 URI: %r", uri)
+            raise
+
         if not path.exists():
             return ""
         try:
             with open(path, "r", encoding="utf-8") as f:
                 return f.read()
-        except Exception:
+        except FileNotFoundError:
+            # 竞态条件下文件被删除，视为正常情况
+            return ""
+        except PermissionError:
+            logger.warning("read: 无权限读取文件: %s (URI: %r)", path, uri)
+            return ""
+        except OSError as e:
+            logger.warning("read: 读取文件失败: %s (URI: %r) - %s", path, uri, e)
             return ""
 
     def write(self, uri: str, content: str, *, _lock: bool = True) -> None:
@@ -86,13 +111,29 @@ class MemoryStore:
             uri: 记忆 URI
             content: 文件内容
             _lock: 是否获取写锁（内部批量操作时设为 False 由上层控制）
+
+        Raises:
+            ValueError: URI 格式非法
+            OSError: 写入失败（如磁盘满、无权限）
         """
-        path = self._resolve_uri(uri)
+        try:
+            path = self._resolve_uri(uri)
+        except ValueError:
+            logger.warning("write: 非法 URI: %r", uri)
+            raise
+
         self._ensure_dir(path.parent)
 
         def _do_write() -> None:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(content)
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(content)
+            except PermissionError as e:
+                logger.error("write: 无权限写入文件: %s (URI: %r) - %s", path, uri, e)
+                raise
+            except OSError as e:
+                logger.error("write: 写入文件失败: %s (URI: %r) - %s", path, uri, e)
+                raise
 
         if _lock:
             with self._write_lock():
@@ -106,8 +147,16 @@ class MemoryStore:
 
         Returns:
             是否成功删除
+
+        Raises:
+            ValueError: URI 格式非法
         """
-        path = self._resolve_uri(uri)
+        try:
+            path = self._resolve_uri(uri)
+        except ValueError:
+            logger.warning("delete: 非法 URI: %r", uri)
+            raise
+
         if not path.exists():
             return False
         with self._write_lock():
@@ -115,12 +164,19 @@ class MemoryStore:
                 path.unlink()
                 self._cleanup_empty_dirs(path.parent)
                 return True
-            except Exception:
+            except PermissionError as e:
+                logger.warning("delete: 无权限删除文件: %s (URI: %r) - %s", path, uri, e)
+                return False
+            except OSError as e:
+                logger.warning("delete: 删除文件失败: %s (URI: %r) - %s", path, uri, e)
                 return False
 
     def exists(self, uri: str) -> bool:
         """检查记忆文件是否存在。"""
-        return self._resolve_uri(uri).exists()
+        try:
+            return self._resolve_uri(uri).exists()
+        except ValueError:
+            return False
 
     def list(self, type_name: str, space: str | None = None) -> list[str]:
         """
@@ -157,9 +213,17 @@ class MemoryStore:
 
         Returns:
             是否成功移动
+
+        Raises:
+            ValueError: URI 格式非法
         """
-        source_path = self._resolve_uri(source_uri)
-        target_path = self._resolve_uri(target_uri)
+        try:
+            source_path = self._resolve_uri(source_uri)
+            target_path = self._resolve_uri(target_uri)
+        except ValueError:
+            logger.warning("move: 非法 URI: source=%r target=%r", source_uri, target_uri)
+            raise
+
         if not source_path.exists():
             return False
         self._ensure_dir(target_path.parent)
@@ -168,7 +232,11 @@ class MemoryStore:
                 shutil.move(str(source_path), str(target_path))
                 self._cleanup_empty_dirs(source_path.parent)
                 return True
-            except Exception:
+            except PermissionError as e:
+                logger.warning("move: 无权限移动文件: %s -> %s - %s", source_path, target_path, e)
+                return False
+            except OSError as e:
+                logger.warning("move: 移动文件失败: %s -> %s - %s", source_path, target_path, e)
                 return False
 
     def _resolve_uri(self, uri: str) -> Path:
@@ -178,10 +246,47 @@ class MemoryStore:
         URI 格式支持：
         - "user/profile.md" → {base_dir}/user/profile.md
         - "memories/user/profile.md" → {base_dir}/user/profile.md（兼容前缀）
+
+        安全校验：
+        - 拒绝包含路径遍历（..）的 URI
+        - 拒绝绝对路径（以 / 开头）
+        - 拒绝空段或非法字符
+        - URI 必须以 .md 结尾
+
+        Raises:
+            ValueError: URI 格式非法或包含路径遍历
         """
+        if not uri or not isinstance(uri, str):
+            raise ValueError("URI 必须为非空字符串")
+
+        # 移除兼容前缀
         clean = uri
         if clean.startswith("memories/"):
             clean = clean[len("memories/"):]
+
+        # 拒绝绝对路径
+        if clean.startswith("/") or clean.startswith("\\"):
+            raise ValueError(f"URI 不能为绝对路径: {uri!r}")
+
+        # 拒绝路径遍历
+        if _URI_TRAVERSAL_PATTERN.search(clean):
+            raise ValueError(f"URI 包含路径遍历: {uri!r}")
+
+        # 拒绝空段
+        if "//" in clean or "\\" in clean.replace("/", ""):
+            # 处理混合分隔符：先统一为 / 再检查
+            normalized = clean.replace("\\", "/")
+            if "//" in normalized:
+                raise ValueError(f"URI 包含空段: {uri!r}")
+
+        # 字符白名单校验
+        if not _URI_SAFE_PATTERN.match(clean):
+            raise ValueError(f"URI 包含非法字符: {uri!r}")
+
+        # 必须以 .md 结尾
+        if not clean.endswith(".md"):
+            raise ValueError(f"URI 必须以 .md 结尾: {uri!r}")
+
         return self._base_dir / clean.replace("/", os.sep)
 
     @staticmethod

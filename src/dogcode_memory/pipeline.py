@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from dogcode_memory.async_ops import AsyncTask, AsyncTaskPool, ExtractionTask
@@ -24,6 +25,8 @@ from dogcode_memory.lifecycle import MemoryArchiver
 from dogcode_memory.retriever import MemoryRetriever
 from dogcode_memory.store import MemoryStore
 from dogcode_memory.updater import MemoryOperation, MemoryUpdater
+
+logger = logging.getLogger(__name__)
 
 
 class MemoryPipeline:
@@ -163,7 +166,7 @@ class MemoryPipeline:
         self,
         session_id: str,
         context: str = "",
-    ) -> str:
+    ) -> dict[str, Any]:
         """
         会话启动：检索并注入相关历史记忆。
 
@@ -174,11 +177,38 @@ class MemoryPipeline:
             context: 会话上下文描述
 
         Returns:
-            格式化的记忆注入文本（供 System Prompt 使用）
+            注入结果字典 {"text": "...", "uris": [...], "count": N, "total_tokens": T}
         """
         if not self._enabled:
-            return ""
-        return self._injector.inject_for_session(session_context=context)
+            logger.debug("on_session_start: 记忆系统已禁用，跳过注入 (session=%s)", session_id)
+            return {"text": "", "uris": [], "count": 0, "total_tokens": 0}
+
+        logger.info("on_session_start: 开始注入记忆 (session=%s, context=%r)", session_id, context[:100] if context else "")
+        result = self._injector.inject_for_session(session_context=context)
+
+        # 记录最近一次注入元数据，供前端查询
+        if result and result.get("count", 0) > 0:
+            import time
+            self._last_injection_meta = {
+                "last_injection": result,
+                "timestamp": time.time(),
+            }
+            logger.info("on_session_start: 注入完成 (session=%s, count=%d, tokens=%d)",
+                        session_id, result.get("count", 0), result.get("total_tokens", 0))
+        else:
+            logger.debug("on_session_start: 未找到相关记忆 (session=%s)", session_id)
+
+        return result
+
+    def get_injected_memory_meta(self) -> dict[str, Any]:
+        """
+        获取最近一次注入记忆的元数据（供前端查询）。
+
+        Returns:
+            {"last_injection": {"text": ..., "uris": [...], "count": ...}, "timestamp": ...}
+            或空字典（尚未注入）
+        """
+        return getattr(self, "_last_injection_meta", {})
 
     def on_session_end(
         self,
@@ -189,6 +219,7 @@ class MemoryPipeline:
         会话结束：提取长期记忆并更新存储。
 
         整个写入流程受文件锁保护，防止多会话同时结束造成冲突。
+        索引更新失败不会回滚文件写入（索引可通过重建修复）。
 
         Args:
             session_id: 会话 ID
@@ -200,12 +231,20 @@ class MemoryPipeline:
         if not self._enabled or not messages:
             return {"extracted": 0, "created": 0, "merged": 0, "skipped": 0}
 
+        logger.info("on_session_end: 开始处理 (session=%s, messages=%d)", session_id, len(messages))
+
         # 提取候选记忆（无需锁，纯内存操作）
-        candidates = self._extractor.extract(session_id, messages)
+        try:
+            candidates = self._extractor.extract(session_id, messages)
+        except Exception as e:
+            logger.warning("on_session_end: 记忆提取失败 (session=%s) - %s", session_id, e)
+            return {"extracted": 0, "created": 0, "merged": 0, "skipped": 0, "error": "extraction_failed"}
+
+        logger.debug("on_session_end: 提取到 %d 个候选记忆 (session=%s)", len(candidates), session_id)
 
         # 去重并生成操作（无需锁，纯内存操作）
         operations: list[MemoryOperation] = []
-        stats = {"extracted": len(candidates), "created": 0, "merged": 0, "skipped": 0}
+        stats: dict[str, Any] = {"extracted": len(candidates), "created": 0, "merged": 0, "skipped": 0}
 
         for candidate in candidates:
             decision = self._deduplicator.deduplicate(candidate)
@@ -244,22 +283,43 @@ class MemoryPipeline:
                 operations.append(MemoryOperation(op_type="write", uri=uri, candidate=candidate_dict))
                 stats["created"] += 1
 
+        if not operations:
+            logger.debug("on_session_end: 无操作需要执行 (session=%s)", session_id)
+            return stats
+
         # 持有文件锁执行所有写入操作（文件存储 + 索引更新）
+        modified: list[str] = []
+        index_errors: list[str] = []
         with self._store.lock:
-            modified = self._updater.apply_operations(operations)
+            try:
+                modified = self._updater.apply_operations(operations)
+            except Exception as e:
+                logger.error("on_session_end: 存储写入失败 (session=%s) - %s", session_id, e)
+                stats["error"] = "store_write_failed"
+                return stats
 
             for uri in modified:
-                content = self._store.read(uri)
-                if content:
-                    from dogcode_memory.format import deserialize_memory
-                    memory = deserialize_memory(content)
-                    self._index.index_memory(
-                        uri=uri,
-                        abstract=memory.abstract or memory.type,
-                        content=memory.content,
-                        updated_at=memory.updated_at,
-                    )
+                try:
+                    content = self._store.read(uri)
+                    if content:
+                        from dogcode_memory.format import deserialize_memory
+                        memory = deserialize_memory(content)
+                        self._index.index_memory(
+                            uri=uri,
+                            abstract=memory.abstract or memory.type,
+                            content=memory.content,
+                            updated_at=memory.updated_at,
+                        )
+                except Exception as e:
+                    logger.warning("on_session_end: 索引更新失败 (uri=%s) - %s", uri, e)
+                    index_errors.append(uri)
 
+        if index_errors:
+            stats["index_errors"] = len(index_errors)
+            logger.warning("on_session_end: %d 条记忆索引更新失败 (session=%s)", len(index_errors), session_id)
+
+        logger.info("on_session_end: 处理完成 (session=%s, created=%d, merged=%d, skipped=%d)",
+                    session_id, stats["created"], stats["merged"], stats["skipped"])
         return stats
 
     def run_maintenance(self) -> dict[str, Any]:
@@ -274,9 +334,16 @@ class MemoryPipeline:
         if not self._enabled:
             return {"archived": 0}
 
-        with self._store.lock:
-            archived = self._archiver.archive_cold_memories()
-        return {"archived": len(archived), "archived_uris": archived}
+        logger.info("run_maintenance: 开始维护任务")
+
+        try:
+            with self._store.lock:
+                archived = self._archiver.archive_cold_memories()
+            logger.info("run_maintenance: 归档完成，%d 条冷记忆已归档", len(archived))
+            return {"archived": len(archived), "archived_uris": archived}
+        except Exception as e:
+            logger.exception("run_maintenance: 维护任务失败")
+            return {"archived": 0, "error": "maintenance_failed"}
 
     def archive_session(
         self,
@@ -298,7 +365,11 @@ class MemoryPipeline:
             归档结果信息
         """
         if not self._enabled or not messages or not self._session_archiver:
+            logger.debug("archive_session: 跳过归档 (session=%s, enabled=%s, has_archiver=%s)",
+                         session_id, self._enabled, self._session_archiver is not None)
             return {"archived": False, "reason": "disabled_or_empty"}
+
+        logger.info("archive_session: 开始归档 (session=%s, messages=%d)", session_id, len(messages))
 
         try:
             record = self._session_archiver.archive(
@@ -306,6 +377,8 @@ class MemoryPipeline:
                 messages=messages,
                 metadata=metadata,
             )
+            logger.info("archive_session: 归档成功 (session=%s, archive_id=%s, messages=%d)",
+                        session_id, record.archive_id, record.message_count)
             return {
                 "archived": True,
                 "archive_id": record.archive_id,
@@ -313,8 +386,15 @@ class MemoryPipeline:
                 "token_count": record.token_count,
                 "summary_length": len(record.summary),
             }
+        except PermissionError as e:
+            logger.error("archive_session: 无权限归档 (session=%s) - %s", session_id, e)
+            return {"archived": False, "reason": "permission_denied"}
+        except OSError as e:
+            logger.error("archive_session: 归档失败 (session=%s) - %s", session_id, e)
+            return {"archived": False, "reason": "io_error"}
         except Exception as e:
-            return {"archived": False, "reason": str(e)}
+            logger.exception("archive_session: 归档异常 (session=%s)", session_id)
+            return {"archived": False, "reason": "internal_error"}
 
     def restore_session(
         self,

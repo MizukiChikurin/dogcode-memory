@@ -67,6 +67,8 @@ def serialize_memory(
         "updated_at": _now_iso(),
         "active_count": memory_data.active_count,
     }
+    if memory_data.abstract:
+        metadata["abstract"] = memory_data.abstract
     if memory_data.source_sessions:
         metadata["source_sessions"] = memory_data.source_sessions
 

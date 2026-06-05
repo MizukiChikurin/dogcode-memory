@@ -62,6 +62,9 @@ from dogcode_memory.monkey_patch import (
     patch_session_save,
 )
 
+# HTTP API（Phase 5 扩展）
+from dogcode_memory.api import MemoryAPIHandler, MemoryAPIServer
+
 __all__ = [
     # 配置
     "MemoryConfig",
@@ -132,4 +135,7 @@ __all__ = [
     "patch_reset_method",
     "patch_message_builder",
     "patch_session_save",
+    # HTTP API（Phase 5 扩展）
+    "MemoryAPIHandler",
+    "MemoryAPIServer",
 ]
